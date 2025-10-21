@@ -1,0 +1,175 @@
+# GitHub Actions workflow: EAS Publish (OTA updates) + optional EAS Build (commented)
+# Copy this file to .github/workflows/eas-publish.yml
+# Secrets required:
+# - EAS_TOKEN             -> EAS CLI token (recommended)
+# - EXPO_TOKEN            -> (optional) Expo token / legacy
+# - SUPABASE_URL          -> (optional) injected to build env if your app requires it
+# - SUPABASE_ANON_KEY     -> (optional) injected to build env if your app requires it
+# - (Optional for builds/submits - see comments below)
+#
+# Strong opinion: use this for automated OTA updates (eas update). For binary releases,
+# run EAS Build + manual review, or enable the build job below and supply signing secrets.
+#
+name: EAS CI - Publish & (optionally) Build
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: "18"
+
+jobs:
+  prepare:
+    name: Prepare & install deps
+    runs-on: ubuntu-latest
+    outputs:
+      cache-hit: ${{ steps.cache.outputs.cache-hit }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+
+      - name: Use stable npm
+        run: npm ci
+
+      - name: Cache node_modules (fallback)
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: node-modules-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            node-modules-${{ runner.os }}-
+
+  eas-publish:
+    name: EAS OTA Publish (recommended)
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install EAS CLI
+        run: npm install -g eas-cli@~2
+
+      - name: Login to EAS
+        env:
+          EAS_TOKEN: ${{ secrets.EAS_TOKEN }}
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          if [ -n "${EAS_TOKEN}" ]; then
+            eas login --token "${EAS_TOKEN}"
+          elif [ -n "${EXPO_TOKEN}" ]; then
+            # fallback for older flows
+            expo login --token "${EXPO_TOKEN}"
+          else
+            echo "No EAS_TOKEN or EXPO_TOKEN provided; aborting."
+            exit 1
+          fi
+
+      - name: Inject runtime env (optional: supabase)
+        # These env vars will be visible during the job only.
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          echo "Supabase vars injected into job environment (not committed)."
+
+      - name: Run tests (optional but recommended)
+        run: |
+          if [ -f package.json ] && npm run | grep -q test; then
+            npm run test --if-present
+          else
+            echo "No test script configured; skipping."
+          fi
+
+      - name: EAS OTA publish (update) to branch "main"
+        # Uses EAS Update (modern) — fallback: replace with `eas publish` if you rely on legacy.
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          EAS_TOKEN: ${{ secrets.EAS_TOKEN }}
+        run: |
+          # Force a clean bundle cache; explicit non-interactive mode for CI
+          # Branch naming strategy: publish to "main" by default — change as needed.
+          npx eas update --branch main --message "CI: $GITHUB_SHA" --platform all --non-interactive
+
+      - name: Post-publish summary
+        run: |
+          echo "EAS update finished. See EAS dashboard for releases and rollout details."
+
+  # Optional: automated native builds and submit (UNCOMMENT to enable)
+  # NOTE: Building & submitting requires signing keys and service account credentials.
+  # Provide these secrets in the repository settings:
+  # - ANDROID_KEYSTORE_BASE64         -> base64-encoded keystore (if using local keystore)
+  # - ANDROID_KEYSTORE_PASSWORD
+  # - ANDROID_KEY_ALIAS
+  # - GOOGLE_PLAY_SERVICE_ACCOUNT_JSON -> base64 of JSON service account for submit
+  # - APP_STORE_CONNECT_API_KEY       -> base64 / or use EAS Submit App Store Connect config
+  #
+  # To enable, remove 'if: false' and populate secrets.
+  eas-build:
+    name: (Optional) EAS Build - create binaries
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: false  # <-- flip this to true to enable builds; keeping disabled by default
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install EAS CLI
+        run: npm install -g eas-cli@~2
+
+      - name: Login to EAS
+        env:
+          EAS_TOKEN: ${{ secrets.EAS_TOKEN }}
+        run: eas login --token "${EAS_TOKEN}"
+
+      # Example: decode Android keystore (if you use keystore provided as base64 secret)
+      - name: Decode Android keystore (if provided)
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        env:
+          KEYBASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          echo "$KEYBASE64" | base64 --decode > android_keystore.jks
+          ls -l android_keystore.jks
+
+      - name: Start EAS Build - Android
+        env:
+          EAS_BUILD_PROFILE: production
+          ANDROID_KEYSTORE_PATH: android_keystore.jks
+        run: |
+          # Build android binary
+          npx eas build --platform android --profile production --non-interactive
+
+      - name: Start EAS Build - iOS
+        # iOS builds require App Store Connect API key or credentials in EAS
+        run: |
+          npx eas build --platform ios --profile production --non-interactive
+
+      - name: Optional: Submit to stores (REQUIRES credentials & secrets)
+        run: |
+          echo "Submitting binaries to stores is sensitive — configure secrets and review 'eas submit' docs before enabling."
